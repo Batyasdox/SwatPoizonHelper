@@ -10,9 +10,15 @@ handlers/calculator.py — Основная бизнес-логика расчё
     запрашивает цену в ЮАНЯХ (¥) и конвертирует по личному курсу из БД.
     Итог = (Цена_Юани * Курс_Из_БД) + Доставка_Руб.
 
-Финал: mock-цена РФ -> чек. ИИ-вердикт GigaChat добавляется в чек ТОЛЬКО если
-при запуске бота тест API прошёл успешно (ai_state.is_ai_available() == True).
-Если нейронка недоступна — чек формируется без ИИ-блока, только математика.
+Финал: РЕАЛЬНЫЙ поиск цены модели в магазинах РФ (fetch_real_rf_price,
+бесплатный парсинг DuckDuckGo) -> чек. Если цену найти не удалось (rf_price == 0),
+в чеке пишется "⚠️ Не удалось найти модель в магазинах РФ", а нейронке
+передаётся фраза "В магазинах РФ цена неизвестна, проанализируй только выгоду
+рублевой цены с Poizon".
+
+ИИ-вердикт GigaChat добавляется в чек ТОЛЬКО если при запуске бота тест API
+прошёл успешно (ai_state.is_ai_available() == True). Если нейронка недоступна —
+чек формируется без ИИ-блока, только математика.
 """
 
 from aiogram import F
@@ -22,7 +28,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import ai_state
 import database
-from api.gigachat import get_gigachat_verdict, get_mock_rf_price
+from api.gigachat import fetch_real_rf_price, get_gigachat_verdict
 from handlers import BotStates, router
 from handlers.start import parse_number, show_main_menu
 
@@ -120,7 +126,7 @@ async def save_shipping(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(BotStates.waiting_for_model_name), F.text)
 async def finish_calculation(message: Message, state: FSMContext) -> None:
-    """Шаг 3 + Финал: считаем итог и печатаем чек (с ИИ-вердиктом, если нейронка доступна)."""
+    """Шаг 3 + Финал: считаем итог, ищем реальную цену РФ и печатаем чек."""
     model_name = message.text.strip()
     if not model_name:
         await message.answer("❌ Ошибка! Название модели не может быть пустым. Попробуйте ещё раз:")
@@ -136,9 +142,12 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     rate = database.get_user_rate(user_id)
 
     if ai_state.is_ai_available():
-        await message.answer("⏳ Считаю заказ и отправляю данные в GigaChat...")
+        await message.answer(
+            "⏳ Считаю заказ, ищу реальную цену в магазинах РФ "
+            "и отправляю данные в GigaChat..."
+        )
     else:
-        await message.answer("⏳ Считаю заказ...")
+        await message.answer("⏳ Считаю заказ и ищу реальную цену в магазинах РФ...")
 
     # --- Расчёт итоговой стоимости ---
     if order_type == "buyer":
@@ -161,13 +170,18 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         shipping_line = f"• Международное Карго: <b>{shipping:,.2f} ₽</b>".replace(",", " ")
         extra_lines = f"• Использован ваш личный курс: <b>{rate:.2f} ₽ / 1 ¥</b>\n"
 
-    rf_price = get_mock_rf_price(total_rub)
-    savings = rf_price - total_rub
+    # --- РЕАЛЬНЫЙ поиск цены такой же пары в магазинах РФ ---
+    rf_price = await fetch_real_rf_price(model_name)
+    rf_found = rf_price > 0
+    savings = (rf_price - total_rub) if rf_found else 0.0
 
     # --- ИИ-вердикт от GigaChat: только если тест при запуске прошёл успешно ---
     verdict_block = ""
     if ai_state.is_ai_available():
         try:
+            # Если rf_price == 0, внутри get_gigachat_verdict нейронке
+            # передаётся фраза: "В магазинах РФ цена неизвестна, проанализируй
+            # только выгоду рублевой цены с Poizon".
             verdict = await get_gigachat_verdict(model_name, total_rub, rf_price)
             verdict_block = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -177,25 +191,41 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
             # Раз ошибка — больше ИИ не используем (до перезапуска бота)
             ai_state.set_ai_available(False)
 
-    # Если ИИ недоступен — добавляем простой математический вывод без нейронки
+    # --- Блок вывода (ИИ или математика), плюс строка про цену РФ ---
+    if rf_found:
+        rf_line = (
+            f"🇷🇺 Цена такой же пары в магазинах РФ (найдено в сети): "
+            f"~{rf_price:,.2f} ₽".replace(",", " ") + "\n"
+            + f"💎 Ваша выгода: <b>{savings:,.2f} ₽</b>\n".replace(",", " ")
+        )
+    else:
+        rf_line = "⚠️ Не удалось найти модель в магазинах РФ\n"
+
     if not verdict_block:
-        savings_pct = (savings / rf_price * 100) if rf_price > 0 else 0.0
-        if savings > 0:
-            math_block = (
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <b>Вывод:</b> покупка выгоднее покупки в РФ примерно на "
-                f"{savings:,.2f} ₽ ({savings_pct:.1f}%).".replace(",", " ") + "\n"
-            )
+        # ИИ недоступен — добавляем простой математический вывод без нейронки.
+        if rf_found:
+            savings_pct = (savings / rf_price * 100) if rf_price > 0 else 0.0
+            if savings > 0:
+                math_block = (
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <b>Вывод:</b> покупка выгоднее покупки в РФ примерно на "
+                    f"{savings:,.2f} ₽ ({savings_pct:.1f}%)."
+                ).replace(",", " ") + "\n"
+            else:
+                math_block = (
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <b>Вывод:</b> покупка дороже рыночной цены в РФ примерно на "
+                    f"{-savings:,.2f} ₽ ({-savings_pct:.1f}%), возможно выгоднее "
+                    f"взять пару локально."
+                ).replace(",", " ") + "\n"
         else:
             math_block = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <b>Вывод:</b> покупка дороже рыночной цены в РФ примерно на "
-                f"{-savings:,.2f} ₽ ({-savings_pct:.1f}%), возможно выгоднее "
-                f"взять пару локально.".replace(",", " ") + "\n"
+                f"💡 <b>Вывод:</b> сравнить с ценами в РФ не удалось — модель "
+                f"не найдена в открытых магазинах. Оценивайте итог самостоятельно.\n"
             )
         verdict_block = math_block
 
-    savings_str = f"{savings:,.2f} ₽".replace(",", " ")
     check_text = (
         f"🧾 <b>ДЕТАЛЬНЫЙ ЧЕК ЗАКАЗА POIZON</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -208,9 +238,8 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         f"{extra_lines}"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔥 <b>ИТОГО: {total_rub:,.2f} ₽</b>\n".replace(",", " ")
-        + f"🇷🇺 Цена такой же пары в РФ (оценка): ~{rf_price:,.2f} ₽".replace(",", " ") + "\n"
-        + f"💎 Ваша выгода: <b>{savings_str}</b>\n"
-        f"{verdict_block}"
+        + rf_line
+        + f"{verdict_block}"
     )
 
     kb = InlineKeyboardMarkup(
