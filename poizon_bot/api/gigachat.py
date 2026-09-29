@@ -1,27 +1,34 @@
 """
-api/gigachat.py — Взаимодействие с API GigaChat от Сбера + ЧЕСТНЫЙ реальный
-поиск цен в магазинах России.
+api/gigachat.py — Взаимодействие с API GigaChat от Сбера + УМНЫЙ анализ
+поисковой выдачи для честного поиска цен в магазинах России.
 
-Здесь реализованы:
- - тест доступности API при запуске бота (test_gigachat_api);
- - получение Access Token по OAuth (с уникальным RqUID через uuid.uuid4());
- - отправка промпта в Chat-эндпоинт и получение ИИ-вердикта;
- - РЕАЛЬНЫЙ (бесплатный, без платных API-ключей) поиск цены модели ЗАДАННОГО
-   РАЗМЕРА в магазинах России через парсинг HTML-выдачи DuckDuckGo
-   (fetch_real_rf_price) с УМНЫМ ДИНАМИЧЕСКИМ ФИЛЬТРОМ:
-     * все цены ниже total_poizon_rub * 0.85 отсекаются — это гарантированно
-       убирает мусор (носки, шнурки, стельки, подделки/паль);
-     * из оставшихся выбрасываются одна самая низкая и одна самая высокая цена
-       (усечённое среднее), считаются только адекватные значения.
+НОВАЯ ЛОГИКА (GigaChat как умный аналитик поисковой выдачи):
+ 1. fetch_search_results(model_name, shoe_size) — асинхронно грузит HTML-выдачу
+    DuckDuckGo по запросу "{model_name} {shoe_size} купить в россии" и собирает
+    первые 5-7 результатов (заголовки сайтов + сниппеты) в одну текстовую
+    строку search_results_text. Никаких платных API-ключей не требуется.
+ 2. get_gigachat_verdict(model_name, shoe_size, total_poizon_rub, credentials)
+    передаёт этот сырой текст поисковой выдачи нейронке вместе с системным
+    промптом. GigaChat САМ анализирует выдачу:
+      - игнорирует оверпрайс официальных дорогих ритейлеров (Street Beat,
+        SuperStep, Brandshop и т.д.);
+      - ищет реальные цены на Poizon-площадках и у локальных реселлеров РФ
+        (Poizon Shop, СДЭК.Шоппинг, Ozon/Маркет с доставкой из-за рубежа);
+      - вычленяет адекватную рыночную цену для конкретного размера;
+      - возвращает строгий JSON {"rf_price": число, "verdict": "текст"}.
+ 3. Функция возвращает кортеж (rf_price: float, verdict: str). Если rf_price
+    равен 0.0 — цену найти не удалось, и вердикт формируется с учётом фразы
+    "В магазинах РФ цена неизвестна, проанализируй только выгоду рублевой
+    цены с Poizon".
 
-Логика использования ИИ: если тест при запуске прошёл — нейронка используется
-в чеках; если тест упал — ИИ-аналитика просто НЕ используется (флаг
-ai_state.AI_AVAILABLE остаётся False). get_gigachat_verdict при любой ошибке
-бросает исключение наружу, чтобы вызывающий код мог сам отключить ИИ.
+OAuth реализован по стандарту Сбера: Basic-авторизация (base64 от
+"ClientID:ClientSecret") + обязательный заголовок RqUID через uuid.uuid4().
+Рабочие эндпоинты берутся из config.py (GIGACHAT_OAUTH_URL /
+GIGACHAT_CHAT_URL), все post-запросы выполняются с ssl=False.
 
-ВАЖНО: рабочие эндпоинты GigaChat задаются в config.py
-(GIGACHAT_OAUTH_URL / GIGACHAT_CHAT_URL). Все post-запросы выполняются
-с ssl=False, как требуется проектом.
+Тест доступности API при запуске бота (test_gigachat_api): если тест прошёл —
+ИИ-аналитика используется в чеках; если упал — ИИ просто НЕ используется
+(флаг ai_state.AI_AVAILABLE остаётся False).
 """
 
 import asyncio
@@ -74,7 +81,7 @@ def _get_basic_auth_header(credentials: str) -> str:
     Нормализует к "ClientID:ClientSecret" и кодирует в base64.
     """
     credentials = credentials.strip()
-    # У множественных '_' в UUID нет, поэтому первый '_' — почти наверняка
+    # У UUID множественных '_' нет, поэтому первый '_' — почти наверняка
     # разделитель ClientID/ClientSecret. Если его нет — пробуем ':' .
     if "_" in credentials:
         client_id, _, client_secret = credentials.partition("_")
@@ -110,15 +117,25 @@ async def _request_token_with_scope(
         return resp.status, await resp.text()
 
 
-async def _get_access_token(session: aiohttp.ClientSession) -> str:
+async def _get_access_token(
+    session: aiohttp.ClientSession, credentials: str | None = None
+) -> str:
     """
     Получает временный Access Token у OAuth-сервера Сбера.
 
     Автоматически перебирает список SCOPE_CANDIDATES, пока не получит
     успешный ответ (HTTP 200 + access_token). Успешно подобранный scope
     кэшируется в модульной переменной _resolved_scope.
+
+    Args:
+        session:     активная aiohttp-сессия;
+        credentials: опциональные ключи "ClientID_ClientSecret"; если не
+                     переданы — берём GIGACHAT_CREDENTIALS из config.py.
     """
     global _resolved_scope
+
+    if credentials is None:
+        credentials = GIGACHAT_CREDENTIALS
 
     candidates = SCOPE_CANDIDATES
     # Если ранее уже подобрали рабочий scope — пробуем его первым.
@@ -127,9 +144,7 @@ async def _get_access_token(session: aiohttp.ClientSession) -> str:
 
     last_error = ""
     for scope in candidates:
-        status, body_text = await _request_token_with_scope(
-            session, GIGACHAT_CREDENTIALS, scope
-        )
+        status, body_text = await _request_token_with_scope(session, credentials, scope)
         if status == 200:
             try:
                 data = json.loads(body_text)
@@ -197,98 +212,422 @@ def sanitize_verdict_text(text: str) -> str:
     return cleaned.strip()
 
 
+# ============================================================================
+# ЧЕСТНЫЙ ПОИСК ЦЕН В МАГАЗИНАХ РФ: СБОР СЫРОЙ ПОИСКОВОЙ ВЫДАЧИ ДЛЯ АНАЛИЗА ИИ
+# (без платных API-ключей, без арифметического среднего — считает нейронка)
+# ============================================================================
+
+# Фейковые User-Agent'ы: меняем их между запросами, чтобы поисковик
+# не заблокировал бота как «бота».
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+
+# HTML-версии поисковой выдачи DuckDuckGo (бесплатные, без ключей).
+DDG_SEARCH_URLS = [
+    "https://html.duckduckgo.com/html/",
+    "https://lite.duckduckgo.com/lite/",
+]
+
+# Сколько результатов выдачи максимум отдаём нейронке на анализ.
+MAX_SEARCH_RESULTS = 7
+
+# Регулярка разбивает выдачу на блоки отдельных результатов.
+# html.duckduckgo.com: каждый результат — div с классом result (или
+# result__body) либо li с классом result__item; внутри могут быть вложенные
+# div'ы, поэтому блок захватывается до начала СЛЕДУЮЩЕГО блока того же типа.
+# lite.duckduckgo.com: каждый результат — строка таблицы <tr>...</tr>.
+_RESULT_BLOCK_RE = re.compile(
+    r"<(?:div|li)\b[^>]*class=\"[^\"]*\bresult(?:__body|__item)?\b[^\"]*\".*?"
+    r"(?=<(?:div|li)\b[^>]*class=\"[^\"]*\bresult(?:__body|__item)?\b|"
+    r"\Z(?!\n))",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Внутри блока: заголовок результата.
+_TITLE_RES = [
+    re.compile(r'<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*>(.*?)</a>', re.DOTALL),
+    re.compile(r"<a\b[^>]*class=['\"]result-link['\"][^>]*>(.*?)</a>", re.DOTALL),
+]
+# Внутри блока: сниппет (текст с ценой). Порядок важен: сначала более
+# специфичные td/span (lite), затем div/a (html-версия).
+_SNIPPET_RES = [
+    re.compile(r'<td\b[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>', re.DOTALL),
+    re.compile(r"<span\b[^>]*class=['\"]result-snippet['\"][^>]*>(.*?)</span>", re.DOTALL),
+    re.compile(r'<(?:div|a)\b[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:div|a)>', re.DOTALL),
+]
+
+
+def _strip_html_tags(fragment: str) -> str:
+    """Удаляет HTML-теги и лишние пробелы из фрагмента выдачи."""
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    text = (
+        text.replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+    return " ".join(text.split()).strip()
+
+
+def _find_in_block(patterns: list[re.Pattern], block: str) -> str:
+    """Возвращает первый непустой текст, найденный в блоке одной из регулярок."""
+    for pattern in patterns:
+        match = pattern.search(block)
+        if match:
+            cleaned = _strip_html_tags(match.group(1))
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def parse_search_results(html: str) -> str:
+    """
+    Превращает HTML поисковой выдачи DuckDuckGo в один текстовый блок вида:
+        Сайт: <домен/заголовок>
+        Описание: <сниппет с ценой>
+    Заголовки и сниппеты извлекаются ПАРАМИ в пределах одного результата
+    (блок-за-блоком), поэтому описание всегда относится к своему сайту.
+    Берутся только первые MAX_SEARCH_RESULTS (5-7) результатов — больше
+    контекста нейронке не нужно, а токенов уходит меньше.
+    При любой неудачной структуре страницы возвращает пустую строку.
+    """
+    if not html:
+        return ""
+
+    blocks = _RESULT_BLOCK_RE.findall(html)
+
+    results: list[str] = []
+    if blocks:
+        # Основной путь: парим каждый блок результата отдельно.
+        for block in blocks:
+            title = _find_in_block(_TITLE_RES, block)
+            snippet = _find_in_block(_SNIPPET_RES, block)
+            if not title and not snippet:
+                continue
+            results.append(f"Сайт: {title}\nОписание: {snippet}\n")
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
+    else:
+        # Подстраховка: структура страницы неизвестна — собираем заголовки и
+        # сниппеты общими регулярками по всей странице.
+        titles_all = [
+            _strip_html_tags(t)
+            for pat in _TITLE_RES
+            for t in pat.findall(html)
+            if _strip_html_tags(t)
+        ]
+        snippets_all = [
+            _strip_html_tags(s)
+            for pat in _SNIPPET_RES
+            for s in pat.findall(html)
+            if _strip_html_tags(s)
+        ]
+        pairs = max(len(titles_all), len(snippets_all))
+        for i in range(pairs):
+            title = titles_all[i] if i < len(titles_all) else ""
+            snippet = snippets_all[i] if i < len(snippets_all) else ""
+            if not title and not snippet:
+                continue
+            results.append(f"Сайт: {title}\nОписание: {snippet}\n")
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
+
+    return "\n".join(results).strip()
+
+
+async def _fetch_ddg_page(session: aiohttp.ClientSession, url: str, query: str) -> str:
+    """
+    Грузит одну страницу поисковой выдачи DuckDuckGo (GET + фейковый User-Agent).
+    При HTTP 202/403/429 (антибот-проверка DuckDuckGo) повторяет попытку с другим
+    User-Agent'ом и растущей паузой. При любой ошибке возвращает пустую строку —
+    падать здесь нельзя.
+    """
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        headers = {
+            "User-Agent": USER_AGENTS[(hash(query) + attempt * 7) % len(USER_AGENTS)],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+        try:
+            async with session.get(
+                url,
+                params={"q": query, "kl": "ru-ru"},
+                headers=headers,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.text(errors="ignore")
+                logger.warning(
+                    "DuckDuckGo %s вернул HTTP %s (попытка %d/%d)",
+                    url, resp.status, attempt + 1, max_attempts,
+                )
+                # 202/403/429 — антибот-пауза, пробуем ещё раз с другой «личностью»
+                if resp.status in (202, 403, 429):
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                return ""
+        except Exception as exc:  # noqa: BLE001 — сеть/DNS/таймаут: страница не найдена
+            logger.warning(
+                "DuckDuckGo %s: ошибка запроса (попытка %d/%d): %s: %s",
+                url, attempt + 1, max_attempts, type(exc).__name__, exc,
+            )
+            await asyncio.sleep(1.5)
+    return ""
+
+
+async def fetch_search_results(model_name: str, shoe_size: str) -> str:
+    """
+    Асинхронно собирает СЫРУЮ текстовую поисковую выдачу DuckDuckGo
+    (первые 5-7 результатов: заголовки сайтов + сниппеты) по запросу
+    "{model_name} {shoe_size} купить в россии".
+
+    Никакой математики здесь БОЛЬШЕ НЕТ — среднее арифметическое не
+    считается. Этот текст целиком отдаётся GigaChat, который сам решает,
+    какие цены настоящие, а какие — оверпрайс официалов или мусор.
+
+    Args:
+        model_name: точное название модели кроссовок;
+        shoe_size:  размер обуви ("42 EU", "27 см" и т.п.) — вшивается в запрос,
+                    чтобы выдача была именно про нужный размер.
+
+    Returns:
+        Строка search_results_text с результатами выдачи либо "" при ошибке /
+        отсутствии результатов.
+    """
+    model_name = (model_name or "").strip()
+    shoe_size = (shoe_size or "").strip()
+    if not model_name:
+        return ""
+
+    # Точный поисковый запрос с размером.
+    query = f"{model_name} {shoe_size} купить в россии".strip()
+
+    try:
+        connector = aiohttp.TCPConnector(ssl=False, limit=5)
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            # Пробуем обе HTML-версии DuckDuckGo, пока не получим выдачу.
+            for url in DDG_SEARCH_URLS:
+                page_html = await _fetch_ddg_page(session, url, query)
+                results_text = parse_search_results(page_html)
+                if results_text:
+                    logger.info(
+                        "fetch_search_results('%s %s'): собрано %d результатов "
+                        "выдачи с %s",
+                        model_name, shoe_size,
+                        results_text.count("Сайт:"), url,
+                    )
+                    return results_text
+                await asyncio.sleep(1.0)  # вежливая пауза, не спамим поисковик
+    except Exception as exc:  # noqa: BLE001 — любая сетевая ошибка => пустая строка
+        logger.warning(
+            "fetch_search_results('%s'): ошибка: %s: %s",
+            model_name, type(exc).__name__, exc,
+        )
+
+    logger.info(
+        "fetch_search_results('%s %s'): поисковая выдача пуста",
+        model_name, shoe_size,
+    )
+    return ""
+
+
+def _parse_ai_json(content: str) -> dict:
+    """
+    Вытаскивает JSON-объект из ответа модели. GigaChat иногда оборачивает
+    JSON в markdown-блок ```json ... ``` или добавляет поясняющий текст вокруг,
+    поэтому сначала чистим обёртку, затем пробуем loads целиком, а если не
+    вышло — ищем первую фигурную скобку и ближайшую закрывающую.
+    """
+    clean = content.replace("```json", "").replace("```", "").strip()
+
+    try:
+        parsed = json.loads(clean)
+        if isinstance(parsed, dict):
+            return parsed
+    except (ValueError, TypeError):
+        pass
+
+    start = clean.find("{")
+    end = clean.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(clean[start : end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+
+    raise ValueError(f"Ответ ИИ не является валидным JSON: {content[:300]}")
+
+
 async def get_gigachat_verdict(
     model_name: str,
+    shoe_size: str,
     total_poizon_rub: float,
-    rf_price_rub: float,
-    shoe_size: str = "",
-) -> str:
+    credentials: str | None = None,
+) -> tuple[float, str]:
     """
-    Асинхронная функция: запрашивает у GigaChat ёмкий вердикт на русском языке
-    о выгодности покупки кроссовок КОНКРЕТНОГО РАЗМЕРА.
+    Гибридный анализ «поиск + нейронка»: GigaChat выступает умным аналитиком
+    поисковой выдачи и сам отсекает оверпрайс и мусор.
+
+    Алгоритм:
+      1. fetch_search_results() собирает сырую текстовую выдачу DuckDuckGo по
+         модели и размеру.
+      2. Получаем Access Token у OAuth-сервера Сбера (Basic + RqUID uuid4,
+         автоматический подбор scope).
+      3. Отправляем в Chat-эндпоинт системный промпт-инструкцию + текст выдачи.
+         Модель обязана вернуть СТРОГИЙ JSON:
+         {"rf_price": число, "verdict": "текст мнения о выгоде на русском"}.
+      4. Парсим JSON и возвращаем (rf_price, verdict).
 
     Args:
         model_name:       точное название модели кроссовок;
-        total_poizon_rub: итоговая стоимость заказа с Poizon в рублях;
-        rf_price_rub:     НАЙДЕННАЯ (после динамической фильтрации) цена такой
-                          же пары в РФ в рублях. 0.0 означает, что цену найти
-                          не удалось — нейронке передаётся специальная
-                          формулировка про анализ только рублевой цены Poizon;
-        shoe_size:        размер обуви (например "42 EU"), добавляется в промпт,
-                          чтобы ИИ учитывал редкость/ходовость размера.
+        shoe_size:        размер обуви — учитывается и в поиске, и в вердикте;
+        total_poizon_rub: итоговая рублёвая стоимость заказа с Poizon;
+        credentials:      опциональные ключи "ClientID_ClientSecret"; по умолчанию
+                          берутся GIGACHAT_CREDENTIALS из config.py.
 
     Returns:
-        Текст вердикта (3-4 предложения) от нейросети (уже без markdown '**').
+        (rf_price, verdict):
+          rf_price > 0  — нейронка нашла реальную рыночную цену в РФ;
+          rf_price == 0 — цену найти не удалось (пустая выдача / ИИ не нашёл
+                          чисел / ошибка сети или парсинга). В этом случае
+                          вердикт всё равно формируется: нейронка получает
+                          инструкцию проанализировать только выгоду рублевой
+                          цены с Poizon.
 
-    Raises:
-        Любое исключение при ошибках сети/авторизации/API пробрасывается
-        наружу — вызывающий код (calculator) сам решит, что ИИ недоступен,
-        отключит его флагом и сформирует чек без ИИ-вердикта.
+    Текст вердикта проходит sanitize_verdict_text(): markdown '**' заменяется
+    на HTML-теги <b>/</b> поочерёдно, чтобы не ломать parse_mode="HTML".
     """
-    size_part = f" размера {shoe_size}" if shoe_size else ""
+    if credentials is None:
+        credentials = GIGACHAT_CREDENTIALS
 
-    if rf_price_rub and rf_price_rub > 0:
-        price_part = (
-            f"выгодна ли покупка кроссовок {model_name}{size_part} за цену "
-            f"{total_poizon_rub:.2f} руб по сравнению с РФ ценой "
-            f"{rf_price_rub:.2f} руб? Обязательно учитывай размер "
-            f"{shoe_size or 'не указан'}: если размер ходовой — сравнение "
-            f"корректно, если редкий — цена в РФ может быть выше из-за дефицита. "
-            f"Укажи примерную выгоду или переплату в рублях и процентах."
-        )
-    else:
-        price_part = (
-            f"В магазинах РФ цена неизвестна, проанализируй только выгоду "
-            f"рублевой цены с Poizon: кроссовки {model_name}{size_part} стоят "
-            f"{total_poizon_rub:.2f} руб под заказ. Оцени, нормальная ли это "
-            f"рыночная цена для такой модели и размера."
-        )
+    # 1. Сырая поисковая выдача для анализа нейронкой.
+    search_context = await fetch_search_results(model_name, shoe_size)
 
-    prompt = (
-        f"Ты — эксперт по покупкам на маркетплейсе Poizon (Dewu). "
-        f"Дай ёмкий вердикт на русском языке (3-4 предложения): "
-        f"{price_part} "
-        f"Если в названии модели есть слово 'Custom' или 'Кастом', "
-        f"обязательно подчеркни эксклюзивность и уникальность такой пары, "
-        f"и то, что для кастомных моделей экономия может быть вторична. "
-        f"Пиши обычный текст, без markdown-разметки со звёздочками."
+    # 2. Системная инструкция для GigaChat-аналитика.
+    system_instruction = (
+        "Ты — умный ИИ-ассистент для анализа цен на кроссовки. Перед тобой "
+        "текст поисковой выдачи по запросу покупки кроссовок в России. "
+        "Твоя задача — найти среди этого текста РЕАЛЬНУЮ цену на указанную "
+        "модель и размер кроссовок в РФ. "
+        "КРИТИЧЕСКИЕ ПРАВИЛА:\n"
+        "1. Игнорируй цены от официальных или очень дорогих магазинов типа "
+        "Street Beat, SuperStep, Brandshop (у них жесткий оверпрайс).\n"
+        "2. Ищи цены на сайтах локальных Poizon-доставщиков и реселлеров "
+        "(типа Poizon Shop, СДЭК.Шоппинг, Ozon/Маркет с доставкой из-за "
+        "рубежа).\n"
+        "3. Из текста выбери ОДНО число — самую адекватную рыночную цену в РФ "
+        "для этой модели и размера. Верни ответ СТРОГО в формате JSON:\n"
+        '{"rf_price": число, "verdict": "текст твоего мнения о выгоде покупки '
+        'на русском языке (3-4 предложения)"}\n'
+        "В тексте вердикта напиши, сколько экономит пользователь по сравнению "
+        "с Poizon, и стоит ли брать. Учитывай размер обуви: редкие размеры "
+        "могут стоить дороже ходовых. Если в названии модели есть слово "
+        "'Custom' или 'Кастом' — обязательно подчеркни эксклюзивность такой "
+        "пары. Если в выдаче нет ни одной подходящей цены, верни rf_price = 0 "
+        "и в verdict отметь, что в магазинах РФ цена неизвестна, проанализировав "
+        "только выгоду рублевой цены с Poizon. Не используй разметку markdown "
+        "(никаких ** звездочек)."
     )
 
-    async with aiohttp.ClientSession() as session:
-        access_token = await _get_access_token(session)
+    # 3. Пользовательский промпт с контекстом поиска.
+    user_prompt = (
+        f"Модель: {model_name}\n"
+        f"Размер: {shoe_size or 'не указан'}\n"
+        f"Итоговая цена на Poizon: {total_poizon_rub:.2f} руб.\n\n"
+        f"Текст поисковой выдачи для анализа:\n{search_context or '(ничего не найдено)'}"
+    )
 
-        chat_headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-        }
-        chat_payload = {
-            "model": GIGACHAT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.4,
-            "stream": False,
-        }
+    chat_payload = {
+        "model": GIGACHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "stream": False,
+    }
 
-        async with session.post(
-            GIGACHAT_CHAT_URL, json=chat_payload, headers=chat_headers, ssl=False
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(
-                    f"GigaChat Chat вернул HTTP {resp.status}: {body[:300]}"
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            # Авторизация Сбера (подбор scope + RqUID внутри _get_access_token).
+            access_token = await _get_access_token(session, credentials)
+
+            chat_headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            }
+
+            async with session.post(
+                GIGACHAT_CHAT_URL, json=chat_payload, headers=chat_headers, ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        "GigaChat Chat вернул HTTP %s: %s", resp.status, body[:300]
+                    )
+                    return 0.0, "⚠️ Ошибка генерации вердикта."
+                chat_res = await resp.json()
+
+        choices = chat_res.get("choices") or []
+        if not choices:
+            logger.warning("GigaChat вернул пустой choices: %s", str(chat_res)[:300])
+            return 0.0, "⚠️ Ошибка генерации вердикта."
+
+        content = (choices[0].get("message") or {}).get("content", "").strip()
+        if not content:
+            return 0.0, "⚠️ Ошибка генерации вердикта."
+
+        # 4. Парсим JSON-ответ от ИИ.
+        data = _parse_ai_json(content)
+
+        try:
+            rf_price = float(data.get("rf_price", 0) or 0)
+        except (ValueError, TypeError):
+            rf_price = 0.0
+        if rf_price < 0:
+            rf_price = 0.0
+
+        verdict = str(data.get("verdict", "")).strip()
+        if not verdict:
+            if rf_price > 0:
+                verdict = (
+                    f"Реальная рыночная цена в РФ найдена: {rf_price:.2f} руб. "
+                    f"Сравните с итогом по Poizon ({total_poizon_rub:.2f} руб.)."
                 )
-            data = await resp.json()
+            else:
+                verdict = (
+                    "В магазинах РФ цена неизвестна, проанализируй только "
+                    "выгоду рублевой цены с Poizon — данных для сравнения нет."
+                )
 
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"GigaChat вернул пустой ответ: {str(data)[:300]}")
+        # Чистим markdown '**' -> HTML <b></b>, чтобы не ломать parse_mode="HTML".
+        return rf_price, sanitize_verdict_text(verdict)
 
-    verdict = choices[0]["message"]["content"].strip()
-    if not verdict:
-        raise RuntimeError("GigaChat вернул пустой текст вердикта")
-
-    # Чистим markdown '**' -> HTML <b></b>, чтобы не ломать parse_mode="HTML".
-    return sanitize_verdict_text(verdict)
+    except Exception as exc:  # noqa: BLE001 — сеть/OAuth/JSON: не роняем бота
+        logger.warning(
+            "get_gigachat_verdict('%s'): ошибка: %s: %s",
+            model_name, type(exc).__name__, exc,
+        )
+        return 0.0, "⚠️ Не удалось распарсить ответ ИИ."
 
 
 async def test_gigachat_api() -> tuple[bool, str]:
@@ -341,223 +680,3 @@ async def test_gigachat_api() -> tuple[bool, str]:
 
     except Exception as exc:  # noqa: BLE001 — ловим ВСЁ: сеть, DNS, SSL, JSON, таймаут
         return False, f"{type(exc).__name__}: {exc}"
-
-
-# ============================================================================
-# ЧЕСТНЫЙ РЕАЛЬНЫЙ ПОИСК ЦЕН В МАГАЗИНАХ РФ (без платных API-ключей)
-# ============================================================================
-
-# Фейковые User-Agent'ы: меняем их между запросами, чтобы поисковик
-# не заблокировал бота как «бота».
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
-
-# HTML-версии поисковой выдачи DuckDuckGo (бесплатные, без ключей).
-DDG_SEARCH_URLS = [
-    "https://html.duckduckgo.com/html/",
-    "https://lite.duckduckgo.com/lite/",
-]
-
-# Жёсткие границы осмысленных цен (подстраховка к динамическому фильтру):
-# меньше 3000 руб оригинальные кроссовки стоить не могут (это носки/шнурки),
-# больше 1.5 млн — оптовая пачка или ошибка парсинга.
-MIN_VALID_RF_PRICE = 3000.0
-MAX_VALID_RF_PRICE = 1_500_000.0
-
-# Коэффициент динамического порога: любые цены НИЖЕ
-# (total_poizon_rub * DYNAMIC_FILTER_COEF) гарантированно мусор
-# (носки, шнурки, стельки, паль) — оригинал в РФ не может стоить
-# сильно дешевле закупки в Китае с доставкой.
-DYNAMIC_FILTER_COEF = 0.85
-
-# Регулярки для поиска цен в тексте выдачи:
-#  1) "от 12 900 руб", "12900 рублей", "цена 12 900 ₽";
-#  2) "₽ после числа": "12 900 ₽";
-#  3) "цена: 12900" — число без suffix, но сразу после слова про цену.
-PRICE_PATTERNS = [
-    re.compile(
-        r"(?:от|до|цена|стоимость)?\s*([\d][\d\s\u00a0\u2009]{3,})\s*"
-        r"(?:руб\.?л?е?й?|рублей?\b)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"([\d][\d\s\u00a0\u2009]{3,})\s*\u20bd"),
-    re.compile(
-        r"(?:цена|стоимость|прайс)[^\d]{0,15}([\d][\d\s\u00a0\u2009]{3,})",
-        re.IGNORECASE,
-    ),
-]
-
-
-def _extract_prices_from_text(text: str) -> list[float]:
-    """
-    Вытаскивает из произвольного HTML/текста все денежные числа вида
-    "от Х ХХХ руб" / "ХХХХХ ₽". Предварительно отсеивает явный мусор по
-    жёстким границам (< 3000 руб и > 1.5 млн руб). Возвращает список
-    УНИКАЛЬНЫХ цен (дубликаты от разных регулярных выражений убираются).
-    """
-    found: set[float] = set()
-    for pattern in PRICE_PATTERNS:
-        for match in pattern.findall(text):
-            digits = re.sub(r"\D", "", match)
-            if not digits:
-                continue
-            try:
-                value = float(digits)
-            except ValueError:
-                continue
-            if MIN_VALID_RF_PRICE <= value <= MAX_VALID_RF_PRICE:
-                found.add(value)
-    return sorted(found)
-
-
-async def _fetch_ddg_page(
-    session: aiohttp.ClientSession, url: str, query: str
-) -> str:
-    """
-    Грузит одну страницу поисковой выдачи DuckDuckGo (GET + фейковый User-Agent).
-    При HTTP 202/403/429 (антибот-проверка DuckDuckGo) повторяет попытку с другим
-    User-Agent'ом и растущей паузой. При любой ошибке возвращает пустую строку —
-    падать здесь нельзя.
-    """
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        headers = {
-            "User-Agent": USER_AGENTS[(hash(query) + attempt * 7) % len(USER_AGENTS)],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        }
-        try:
-            async with session.get(
-                url,
-                params={"q": query, "kl": "ru-ru"},
-                headers=headers,
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.text(errors="ignore")
-                logger.warning(
-                    "DuckDuckGo %s вернул HTTP %s (попытка %d/%d)",
-                    url, resp.status, attempt + 1, max_attempts,
-                )
-                # 202/403/429 — антибот-пауза, пробуем ещё раз с другой «личностью»
-                if resp.status in (202, 403, 429):
-                    await asyncio.sleep(1.5 * (attempt + 1))
-                    continue
-                return ""
-        except Exception as exc:  # noqa: BLE001 — сеть/DNS/таймаут: страница не найдена
-            logger.warning(
-                "DuckDuckGo %s: ошибка запроса (попытка %d/%d): %s: %s",
-                url, attempt + 1, max_attempts, type(exc).__name__, exc,
-            )
-            await asyncio.sleep(1.5)
-    return ""
-
-
-async def fetch_real_rf_price(
-    model_name: str, shoe_size: str, total_poizon_rub: float
-) -> float:
-    """
-    Асинхронный ЧЕСТНЫЙ поиск цены модели ЗАДАННОГО РАЗМЕРА в магазинах России
-    (Яндекс.Маркет, СДЭК.Шоппинг, Спортмастер и др.) через бесплатный парсинг
-    HTML-выдачи DuckDuckGo. Никаких платных API-ключей не требует.
-
-    Алгоритм:
-      1. Формирует точный поисковый запрос:
-         "{model_name} {shoe_size} купить в россии цена руб".
-      2. Делает асинхронный GET-запрос через aiohttp с фейковым User-Agent.
-      3. Извлекает регулярными выражениями все найденные цены в список.
-      4. ДИНАМИЧЕСКАЯ ФИЛЬТРАЦИЯ: min_allowed_price = total_poizon_rub * 0.85;
-         все цены НИЖЕ порога удаляются (гарантированно отсекает шнурки,
-         носки и паль).
-      5. УСЕЧЁННОЕ СРЕДНЕЕ: список сортируется по возрастанию; если элементов
-         больше 4 — удаляются ОДНА самая низкая и ОДНА самая высокая цена.
-      6. Возвращает среднее арифметическое оставшихся цен.
-
-    Args:
-        model_name:       точное название модели кроссовок;
-        shoe_size:        размер обуви, вшитый в поисковый запрос ("42 EU");
-        total_poizon_rub: итоговая рублёвая цена заказа с Poizon — база для
-                          динамического порога фильтрации.
-
-    Returns:
-        Найденная усечённая средняя цена в рублях либо 0.0, если после
-        фильтрации список пуст или произошла любая ошибка.
-    """
-    model_name = (model_name or "").strip()
-    shoe_size = (shoe_size or "").strip()
-    if not model_name:
-        return 0.0
-
-    # 1. Точный поисковый запрос с размером.
-    queries = [
-        f"{model_name} {shoe_size} купить в россии цена руб",
-        f"{model_name} {shoe_size} купить цена руб",
-    ]
-
-    all_prices: list[float] = []
-    try:
-        connector = aiohttp.TCPConnector(ssl=False, limit=5)
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=aiohttp.ClientTimeout(total=60)
-        ) as session:
-            for query in queries:
-                for url in DDG_SEARCH_URLS:
-                    page_html = await _fetch_ddg_page(session, url, query)
-                    if page_html:
-                        all_prices.extend(_extract_prices_from_text(page_html))
-                    await asyncio.sleep(1.0)  # вежливая пауза, не спамим поисковик
-                if all_prices:
-                    break  # первый запрос уже дал цены — второй не нужен
-    except Exception as exc:  # noqa: BLE001 — любая ошибка => возвращаем 0
-        logger.warning(
-            "fetch_real_rf_price('%s'): ошибка: %s: %s",
-            model_name, type(exc).__name__, exc,
-        )
-        return 0.0
-
-    if not all_prices:
-        logger.info(
-            "fetch_real_rf_price('%s %s'): цены не найдены", model_name, shoe_size
-        )
-        return 0.0
-
-    # 4. ДИНАМИЧЕСКАЯ ФИЛЬТРАЦИЯ: отсечь всё, что дешевле 85% цены Poizon.
-    unique_prices = sorted(set(all_prices))
-    total_poizon_rub = float(total_poizon_rub or 0.0)
-    if total_poizon_rub > 0:
-        min_allowed_price = total_poizon_rub * DYNAMIC_FILTER_COEF
-        unique_prices = [p for p in unique_prices if p >= min_allowed_price]
-        logger.debug(
-            "fetch_real_rf_price('%s'): порог %.2f руб, после фильтра %d цен",
-            model_name, min_allowed_price, len(unique_prices),
-        )
-
-    if not unique_prices:
-        logger.info(
-            "fetch_real_rf_price('%s %s'): после динамической фильтрации не "
-            "осталось ни одной честной цены (весь мусор отсеян)",
-            model_name, shoe_size,
-        )
-        return 0.0
-
-    # 5. УСЕЧЁННОЕ СРЕДНЕЕ: при выборке > 4 убираем самую низкую и самую высокую.
-    trimmed = list(unique_prices)  # список уже отсортирован по возрастанию
-    if len(trimmed) > 4:
-        trimmed = trimmed[1:-1]
-
-    # 6. Среднее арифметическое оставшихся.
-    average = sum(trimmed) / len(trimmed)
-    logger.info(
-        "fetch_real_rf_price('%s %s'): собрано %d уникальных цен, после "
-        "фильтрации %d, итого среднее = %.2f руб",
-        model_name, shoe_size, len(set(all_prices)), len(trimmed), average,
-    )
-    return round(average, 2)

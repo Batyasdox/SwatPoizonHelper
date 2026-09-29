@@ -16,16 +16,22 @@ handlers/calculator.py — Основная бизнес-логика расчё
   Шаг 3 — РАЗМЕР кроссовок (например "42 EU");
   Шаг 4 — точное название модели.
 
-Финал: ЧЕСТНЫЙ поиск цены модели заданного размера в магазинах РФ
-(fetch_real_rf_price с динамической фильтрацией от мусора: носки/шнурки/паль
-отсекаются порогом total_poizon_rub * 0.85) -> детальный HTML-чек.
-Если rf_price == 0, в чеке пишется
-"⚠️ Не удалось найти данный размер модели в магазинах РФ", а нейронке
-передаётся инструкция проанализировать только выгоду рублевой цены с Poizon.
+Финал (НОВАЯ ЛОГИКА): честный анализ цен в РФ делает GigaChat как умный
+аналитик поисковой выдачи. Один вызов:
+    rf_price, verdict = await get_gigachat_verdict(
+        model_name, shoe_size, total_rub, GIGACHAT_CREDENTIALS)
+нейронка сама получает сырую выдачу DuckDuckGo, отсекает оверпрайс официалов
+(Street Beat и т.п.) и мусор, и возвращает реальную рыночную цену + вердикт.
+Старый вызов fetch_real_rf_price с арифметическим средним УДАЛЁН.
 
-ИИ-вердикт GigaChat добавляется в чек ТОЛЬКО если при запуске бота тест API
-прошёл успешно (ai_state.is_ai_available() == True). Если нейронка недоступна —
-чек формируется без ИИ-блока, только математика. Текст вердикта предварительно
+Если rf_price == 0, в HTML-чеке вместо цены РФ пишется
+"⚠️ Не удалось найти данный размер модели в магазинах РФ", а нейронка при
+этом получает инструкцию проанализировать только выгоду рублевой цены Poizon
+(это зашито в системный промпт api/gigachat.py).
+
+ИИ используется ТОЛЬКО если при запуске бота тест API прошёл успешно
+(ai_state.is_ai_available() == True). Если нейронка недоступна — чек
+формируется без ИИ-блока, только математика. Текст вердикта предварительно
 очищается от markdown '**' (замена на <b>/</b> поочерёдно), чтобы не ломать
 HTML-разметку сообщения.
 """
@@ -37,7 +43,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import ai_state
 import database
-from api.gigachat import fetch_real_rf_price, get_gigachat_verdict
+from api.gigachat import get_gigachat_verdict
+from config import GIGACHAT_CREDENTIALS
 from handlers import BotStates, router
 from handlers.start import parse_number
 
@@ -114,7 +121,7 @@ async def save_price(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(BotStates.waiting_for_shipping), F.text)
 async def save_shipping(message: Message, state: FSMContext) -> None:
-    """Шаг 2: принимаем доставку в рублях и просим РАЗМЕР (новый Шаг 3)."""
+    """Шаг 2: принимаем доставку в рублях и просим РАЗМЕР (Шаг 3)."""
     try:
         shipping = parse_number(message.text)
         if shipping < 0:
@@ -154,7 +161,7 @@ async def save_size(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(BotStates.waiting_for_model_name), F.text)
 async def finish_calculation(message: Message, state: FSMContext) -> None:
-    """Шаг 4 + Финал: считаем итог, честно ищем цену РФ и печатаем чек."""
+    """Шаг 4 + Финал: считаем итог, отдаём выдачу поиска на анализ ИИ, печатаем чек."""
     model_name = message.text.strip()
     if not model_name:
         await message.answer("❌ Ошибка! Название модели не может быть пустым. Попробуйте ещё раз:")
@@ -172,13 +179,11 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
 
     if ai_state.is_ai_available():
         await message.answer(
-            "⏳ Считаю заказ, ищу реальную цену вашего размера в магазинах РФ "
-            "и отправляю данные в GigaChat..."
+            "⏳ Считаю заказ, ищу поисковую выдачу по вашему размеру в РФ "
+            "и отправляю данные на анализ в GigaChat..."
         )
     else:
-        await message.answer(
-            "⏳ Считаю заказ и ищу реальную цену вашего размера в магазинах РФ..."
-        )
+        await message.answer("⏳ Считаю заказ...")
 
     # --- Расчёт итоговой стоимости ---
     if order_type == "buyer":
@@ -203,35 +208,43 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
 
     size_line = f"📏 Размер: <b>{shoe_size}</b>\n" if shoe_size else ""
 
-    # --- ЧЕСТНЫЙ поиск цены такого же размера в магазинах РФ ---
-    # Внутри fetch_real_rf_price все найденные цены ниже total_rub * 0.85
-    # отсеиваются как гарантированный мусор (носки, шнурки, паль), а затем
-    # считается усечённое среднее (без одной минимальной и максимальной).
-    rf_price = await fetch_real_rf_price(model_name, shoe_size, total_rub)
+    # --- ЧЕСТНЫЙ анализ цен в РФ: один вызов (поиск-выдача + GigaChat) ---
+    # Нейронка сама анализирует сырую поисковую выдачу, игнорирует оверпрайс
+    # официальных магазинов (Street Beat и т.п.), находит реальные цены на
+    # Poizon-площадках РФ и возвращает (rf_price, verdict).
+    rf_price = 0.0
+    verdict_block = ""
+
+    if ai_state.is_ai_available():
+        try:
+            rf_price, verdict = await get_gigachat_verdict(
+                model_name, shoe_size, total_rub, GIGACHAT_CREDENTIALS
+            )
+            # Вердикт уже очищен от markdown '**' (санитайзер в api/gigachat.py).
+            if verdict:
+                verdict_block = (
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}\n"
+                )
+        except Exception as exc:  # noqa: BLE001 — нейронка отвалилась в процессе
+            logger_msg = f"{type(exc).__name__}: {exc}"
+            import logging
+
+            logging.getLogger("root").warning(
+                "GigaChat упал во время расчёта, отключаю ИИ: %s", logger_msg
+            )
+            # Раз ошибка — больше ИИ не используем (до перезапуска бота)
+            ai_state.set_ai_available(False)
+            rf_price = 0.0
+            verdict_block = ""
+
     rf_found = rf_price > 0
     savings = (rf_price - total_rub) if rf_found else 0.0
 
-    # --- ИИ-вердикт от GigaChat: только если тест при запуске прошёл успешно ---
-    verdict_block = ""
-    if ai_state.is_ai_available():
-        try:
-            # Если rf_price == 0, внутри get_gigachat_verdict нейронке
-            # передаётся инструкция: "В магазинах РФ цена неизвестна,
-            # проанализируй только выгоду рублевой цены с Poizon".
-            # Размер обуви также учитывается моделью в вердикте.
-            verdict = await get_gigachat_verdict(model_name, total_rub, rf_price, shoe_size)
-            verdict_block = (
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}\n"
-            )
-        except Exception:  # noqa: BLE001 — нейронка отвалилась в процессе работы
-            # Раз ошибка — больше ИИ не используем (до перезапуска бота)
-            ai_state.set_ai_available(False)
-
-    # --- Блок вывода (ИИ или математика), плюс строка про цену РФ ---
+    # --- Строка про цену РФ в чеке ---
     if rf_found:
         rf_line = (
-            f"🇷🇺 Цена такого же размера в магазинах РФ (найдено в сети): "
+            f"🇷🇺 Реальная цена в магазинах РФ (по анализу ИИ): "
             f"~{rf_price:,.2f} ₽".replace(",", " ") + "\n"
             + f"💎 Ваша выгода: <b>{savings:,.2f} ₽</b>\n".replace(",", " ")
         )
