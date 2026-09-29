@@ -36,6 +36,8 @@ handlers/calculator.py — Основная бизнес-логика расчё
 HTML-разметку сообщения.
 """
 
+import logging
+
 from aiogram import F
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
@@ -43,10 +45,12 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import ai_state
 import database
-from api.gigachat import get_gigachat_verdict
+from api.gigachat import get_gigachat_verdict, sanitize_verdict_text
 from config import GIGACHAT_CREDENTIALS
 from handlers import BotStates, router
 from handlers.start import parse_number
+
+logger = logging.getLogger("root")
 
 
 @router.callback_query(F.data == "menu_calculate")
@@ -220,18 +224,19 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
             rf_price, verdict = await get_gigachat_verdict(
                 model_name, shoe_size, total_rub, GIGACHAT_CREDENTIALS
             )
-            # Вердикт уже очищен от markdown '**' (санитайзер в api/gigachat.py).
+            # Подстраховка: вердикт обычно уже очищен от markdown '**'
+            # (санитайзер в api/gigachat.py), но если текст пришёл из другого
+            # места — повторная очистка безопасна (идемпотентентна).
+            verdict = sanitize_verdict_text(verdict)
             if verdict:
                 verdict_block = (
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}\n"
                 )
         except Exception as exc:  # noqa: BLE001 — нейронка отвалилась в процессе
-            logger_msg = f"{type(exc).__name__}: {exc}"
-            import logging
-
-            logging.getLogger("root").warning(
-                "GigaChat упал во время расчёта, отключаю ИИ: %s", logger_msg
+            logger.warning(
+                "GigaChat упал во время расчёта, отключаю ИИ: %s: %s",
+                type(exc).__name__, exc,
             )
             # Раз ошибка — больше ИИ не используем (до перезапуска бота)
             ai_state.set_ai_available(False)
