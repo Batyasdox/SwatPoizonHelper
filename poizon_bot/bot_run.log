@@ -1,0 +1,6 @@
+2026-09-29 13:07:44,121 | WARNING | root | ❌ GigaChat недоступен (RuntimeError: OAuth Сбера вернул HTTP 400: {"code":1,"message":"scope data format invalid"}). ИИ-аналитика ОТКЛЮЧЕНА, бот будет работать только с математическими расчётами.
+2026-09-29 13:07:44,121 | INFO | aiogram.dispatcher | Start polling
+2026-09-29 13:07:44,291 | INFO | aiogram.dispatcher | Run polling for bot @SwatpoizonBot id=8840186453 - 'Poizon Helper'
+2026-09-29 13:08:20,791 | WARNING | aiogram.dispatcher | Received SIGTERM signal
+2026-09-29 13:08:20,792 | INFO | aiogram.dispatcher | Polling stopped for bot @SwatpoizonBot id=8840186453 - 'Poizon Helper'
+2026-09-29 13:08:20,792 | INFO | aiogram.dispatcher | Polling stopped

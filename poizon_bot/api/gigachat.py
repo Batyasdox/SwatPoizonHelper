@@ -17,8 +17,10 @@ ai_state.AI_AVAILABLE остаётся False). get_gigachat_verdict при лю�
 с ssl=False, как требуется проектом.
 """
 
+import asyncio
 import base64
 import json
+import logging
 import uuid
 
 import aiohttp
@@ -30,53 +32,118 @@ from config import (
     GIGACHAT_OAUTH_URL,
 )
 
+logger = logging.getLogger("root")
 
-def _get_basic_auth_header() -> str:
+# Список candidate scope'ов, которые бот перебирает при авторизации.
+# Разные типы ключей в кабинете Сбера требуют разные значения scope:
+#   - GIGACHTAPI                  — классический «Механизм вызова GigaChat»;
+#   - GIGACHAT_API_PERS           — персональный режим доступа;
+#   - GIGACHAT_API_CORP           — корпоративный режим;
+#   - GIGACHAT_API_CORP_RTM       — корпоративный RTM;
+#   - GIGACHAT_API_STATE          / GIGACHAT_API_GOV — гос/муниципальные.
+# Бот сам подберёт подходящий — ничего вручную вписывать не нужно.
+SCOPE_CANDIDATES = [
+    "GIGACHTAPI",
+    "GIGACHAT_API_PERS",
+    "GIGACHAT_API_PERSONAL",
+    "GIGACHAT_API_CORP",
+    "GIGACHAT_API_CORP_RTM",
+    "GIGACHAT_API_STATE",
+    "GIGACHAT_API_GOV",
+]
+
+# Кэш: успешно подобранный scope запоминаем, чтобы не долбить OAuth подряд.
+_resolved_scope: str | None = None
+
+
+def _get_basic_auth_header(credentials: str) -> str:
     """
     Формирует заголовок Authorization: Basic ... для OAuth-запроса.
-    Credentials кодируются в base64 в формате "ClientID:ClientSecret"
-    (в конфиге ключ может быть указан через "_", заменим на ":").
+
+    Принимает credentials в любом из форматов:
+      - "ClientID_ClientSecret"  (разделитель '_', как просит Сбер);
+      - "ClientID:ClientSecret"  (разделитель ':').
+    Нормализует к "ClientID:ClientSecret" и кодирует в base64.
     """
-    credentials = GIGACHAT_CREDENTIALS.replace("_", ":", 1)
-    raw = credentials.encode("utf-8")
-    token = base64.b64encode(raw).decode("utf-8")
+    credentials = credentials.strip()
+    # Умножественных '_' в UUID нет, поэтому первый '_' — почти наверняка
+    # разделитель ClientID/ClientSecret. Если его нет — пробуем ':' .
+    if "_" in credentials:
+        client_id, _, client_secret = credentials.partition("_")
+    elif ":" in credentials:
+        client_id, _, client_secret = credentials.partition(":")
+    else:
+        raise ValueError(
+            "GIGACHAT_CREDENTIALS должен быть в формате 'ClientID_ClientSecret'"
+        )
+    normalized = f"{client_id.strip()}:{client_secret.strip()}"
+    token = base64.b64encode(normalized.encode("utf-8")).decode("utf-8")
     return f"Basic {token}"
+
+
+async def _request_token_with_scope(
+    session: aiohttp.ClientSession, credentials: str, scope: str
+) -> tuple[int, str]:
+    """
+    Делает ОДИН OAuth-запрос с указанным scope.
+    Возвращает (HTTP-статус, текст ответа). Исключений не бросает.
+    """
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Accept": "application/json",
+        "Authorization": _get_basic_auth_header(credentials),
+        "RqUID": str(uuid.uuid4()),  # обязательный уникальный ID запроса (uuid4)
+    }
+    payload = {"scope": scope}
+
+    async with session.post(
+        GIGACHAT_OAUTH_URL, data=payload, headers=headers, ssl=False
+    ) as resp:
+        return resp.status, await resp.text()
 
 
 async def _get_access_token(session: aiohttp.ClientSession) -> str:
     """
     Получает временный Access Token у OAuth-сервера Сбера.
-    В headers обязательно передаём уникальный RqUID (uuid4).
-    """
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        "Accept": "application/json",
-        "Authorization": _get_basic_auth_header(),
-        "RqUID": str(uuid.uuid4()),
-    }
-    # ВНИМАНИЕ: значение scope зависит от типа ключа в кабинете Сбера
-    # (developers.sber.ru -> ваш проект -> GigaAPI -> "Спецификация доступа"):
-    #   - GIGACHTAPI                — стандартный scope для GigaChat;
-    #   - GIGACHAT_API_PERSONAL     — персональный режим ("Индивидуальный");
-    #   - GIGACHAT_API_CORP_FQBK и др. — корпоративные режимы.
-    # Если OAuth вернёт "scope data format invalid" — откройте карточку ключа
-    # в кабинете Сбера и скопируйте значение scope оттуда точно как написано.
-    payload = {"scope": "GIGACHTAPI"}
 
-    async with session.post(GIGACHAT_OAUTH_URL, data=payload, headers=headers, ssl=False) as resp:
-        body_text = await resp.text()
-        if resp.status != 200:
-            raise RuntimeError(
-                f"OAuth Сбера вернул HTTP {resp.status}: {body_text[:300]}"
-            )
-        try:
-            data = json.loads(body_text)
-        except ValueError:
-            raise RuntimeError(f"OAuth Сбера вернул не-JSON ответ: {body_text[:300]}")
-        access_token = data.get("access_token")
-        if not access_token:
-            raise RuntimeError(f"Не удалось получить Access Token от Сбера: {data}")
-        return access_token
+    Автоматически перебирает список SCOPE_CANDIDATES, пока не получит
+    успешный ответ (HTTP 200 + access_token). Успешно подобранный scope
+    кэшируется в модульной переменной _resolved_scope.
+    """
+    global _resolved_scope
+
+    candidates = SCOPE_CANDIDATES
+    # Если ранее уже подобрали рабочий scope — пробуем его первым.
+    if _resolved_scope and _resolved_scope in candidates:
+        candidates = [_resolved_scope] + [s for s in candidates if s != _resolved_scope]
+
+    last_error = ""
+    for scope in candidates:
+        status, body_text = await _request_token_with_scope(
+            session, GIGACHAT_CREDENTIALS, scope
+        )
+        if status == 200:
+            try:
+                data = json.loads(body_text)
+            except ValueError:
+                last_error = f"scope={scope}: ответ не JSON: {body_text[:200]}"
+                continue
+            access_token = data.get("access_token")
+            if access_token:
+                if _resolved_scope != scope:
+                    _resolved_scope = scope
+                    logger.info("✅ GigaChat OAuth: подобран рабочий scope '%s'", scope)
+                return access_token
+            last_error = f"scope={scope}: в ответе нет access_token: {body_text[:200]}"
+        else:
+            last_error = f"scope={scope}: HTTP {status}: {body_text[:200]}"
+            # Если ошибка явно про неверные credentials (401), смысла крутить
+            # остальные scope нет — сервер аутентификацию не прошёл.
+            if status in (401, 403):
+                break
+        await asyncio.sleep(0.2)  # маленькая пауза между попытками
+
+    raise RuntimeError(f"OAuth Сбера отверг все варианты scope. Последняя ошибка: {last_error}")
 
 
 async def get_gigachat_verdict(model_name: str, total_poizon_rub: float, rf_price_rub: float) -> str:
