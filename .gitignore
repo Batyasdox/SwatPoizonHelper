@@ -1,5 +1,3 @@
-# Logs and temp files
-*.log
-
-# Databases
-*.db
+# Python compiled files
+__pycache__/
+*.pyc
