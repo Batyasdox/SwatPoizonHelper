@@ -10,15 +10,24 @@ handlers/calculator.py — Основная бизнес-логика расчё
     запрашивает цену в ЮАНЯХ (¥) и конвертирует по личному курсу из БД.
     Итог = (Цена_Юани * Курс_Из_БД) + Доставка_Руб.
 
-Финал: РЕАЛЬНЫЙ поиск цены модели в магазинах РФ (fetch_real_rf_price,
-бесплатный парсинг DuckDuckGo) -> чек. Если цену найти не удалось (rf_price == 0),
-в чеке пишется "⚠️ Не удалось найти модель в магазинах РФ", а нейронке
-передаётся фраза "В магазинах РФ цена неизвестна, проанализируй только выгоду
-рублевой цены с Poizon".
+Цепочка шагов FSM:
+  Шаг 1 — цена (руб для Байера / юани для Карго);
+  Шаг 2 — доставка в рублях;
+  Шаг 3 — РАЗМЕР кроссовок (например "42 EU");
+  Шаг 4 — точное название модели.
+
+Финал: ЧЕСТНЫЙ поиск цены модели заданного размера в магазинах РФ
+(fetch_real_rf_price с динамической фильтрацией от мусора: носки/шнурки/паль
+отсекаются порогом total_poizon_rub * 0.85) -> детальный HTML-чек.
+Если rf_price == 0, в чеке пишется
+"⚠️ Не удалось найти данный размер модели в магазинах РФ", а нейронке
+передаётся инструкция проанализировать только выгоду рублевой цены с Poizon.
 
 ИИ-вердикт GigaChat добавляется в чек ТОЛЬКО если при запуске бота тест API
 прошёл успешно (ai_state.is_ai_available() == True). Если нейронка недоступна —
-чек формируется без ИИ-блока, только математика.
+чек формируется без ИИ-блока, только математика. Текст вердикта предварительно
+очищается от markdown '**' (замена на <b>/</b> поочерёдно), чтобы не ломать
+HTML-разметку сообщения.
 """
 
 from aiogram import F
@@ -30,7 +39,7 @@ import ai_state
 import database
 from api.gigachat import fetch_real_rf_price, get_gigachat_verdict
 from handlers import BotStates, router
-from handlers.start import parse_number, show_main_menu
+from handlers.start import parse_number
 
 
 @router.callback_query(F.data == "menu_calculate")
@@ -50,20 +59,20 @@ async def choose_order_type(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(BotStates.choosing_type), F.data.in_({"type_buyer", "type_cargo"}))
 async def ask_price(callback: CallbackQuery, state: FSMContext) -> None:
-    """Сохраняем тип заказа и просим цену (руб для байера, юани для карго)."""
+    """Шаг 1: сохраняем тип заказа и просим цену (руб для байера, юани для карго)."""
     order_type = "buyer" if callback.data == "type_buyer" else "cargo"
     await state.update_data(order_type=order_type)
     await state.set_state(BotStates.waiting_for_price)
 
     if order_type == "buyer":
         text = (
-            "💰 Шаг 1/3 — Цена\n\n"
+            "💰 Шаг 1/4 — Цена\n\n"
             "Введите стоимость пары в РУБЛЯХ (которую вам озвучил Байер "
             "с учетом его комиссии):"
         )
     else:
         text = (
-            "💰 Шаг 1/3 — Цена\n\n"
+            "💰 Шаг 1/4 — Цена\n\n"
             "Введите чистую цену товара на Poizon в юанях (¥). "
             "Если есть доставка по Китаю, прибавьте её:"
         )
@@ -90,13 +99,13 @@ async def save_price(message: Message, state: FSMContext) -> None:
 
     if order_type == "buyer":
         text = (
-            "🚚 Шаг 2/3 — Доставка\n\n"
+            "🚚 Шаг 2/4 — Доставка\n\n"
             "Введите стоимость доставки до вашего города в рублях (если она не "
             "включена в стоимость Байера, иначе введите 0):"
         )
     else:
         text = (
-            "🚚 Шаг 2/3 — Доставка\n\n"
+            "🚚 Шаг 2/4 — Доставка\n\n"
             "Введите стоимость международной доставки Карго в рублях "
             "(за вес, упаковку и страховку):"
         )
@@ -105,7 +114,7 @@ async def save_price(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(BotStates.waiting_for_shipping), F.text)
 async def save_shipping(message: Message, state: FSMContext) -> None:
-    """Шаг 2: принимаем доставку в рублях и просим название модели."""
+    """Шаг 2: принимаем доставку в рублях и просим РАЗМЕР (новый Шаг 3)."""
     try:
         shipping = parse_number(message.text)
         if shipping < 0:
@@ -115,18 +124,37 @@ async def save_shipping(message: Message, state: FSMContext) -> None:
         return  # Состояние НЕ сбрасываем
 
     await state.update_data(shipping=shipping)
+    await state.set_state(BotStates.waiting_for_size)
+
+    await message.answer(
+        "📏 Шаг 3/4 — Размер\n\n"
+        "Введите нужный размер кроссовок (например: 42 EU или 9 US):"
+    )
+
+
+@router.message(StateFilter(BotStates.waiting_for_size), F.text)
+async def save_size(message: Message, state: FSMContext) -> None:
+    """Шаг 3: принимаем размер (текстовое значение: '42 EU', '9 US' и т.п.)."""
+    shoe_size = " ".join(message.text.split()).strip()
+    if not shoe_size or len(shoe_size) > 30:
+        await message.answer(
+            "❌ Ошибка! Введите корректный размер (например: 42 EU или 9 US)."
+        )
+        return  # Состояние НЕ сбрасываем
+
+    await state.update_data(shoe_size=shoe_size)
     await state.set_state(BotStates.waiting_for_model_name)
 
     await message.answer(
-        "🤖 Шаг 3/3 — ИИ-анализ\n\n"
-        "Напишите точное название модели кроссовков для ИИ-анализа "
-        "(например: Nike Air Force 1 Low):"
+        "👟 Шаг 4/4 — Модель\n\n"
+        "Напишите точное название модели кроссовок (например: "
+        "Nike Air Force 1 Low White):"
     )
 
 
 @router.message(StateFilter(BotStates.waiting_for_model_name), F.text)
 async def finish_calculation(message: Message, state: FSMContext) -> None:
-    """Шаг 3 + Финал: считаем итог, ищем реальную цену РФ и печатаем чек."""
+    """Шаг 4 + Финал: считаем итог, честно ищем цену РФ и печатаем чек."""
     model_name = message.text.strip()
     if not model_name:
         await message.answer("❌ Ошибка! Название модели не может быть пустым. Попробуйте ещё раз:")
@@ -138,16 +166,19 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     order_type = data.get("order_type", "cargo")
     price = float(data.get("price", 0.0))
     shipping = float(data.get("shipping", 0.0))
+    shoe_size = str(data.get("shoe_size", "")).strip()
     user_id = message.from_user.id
     rate = database.get_user_rate(user_id)
 
     if ai_state.is_ai_available():
         await message.answer(
-            "⏳ Считаю заказ, ищу реальную цену в магазинах РФ "
+            "⏳ Считаю заказ, ищу реальную цену вашего размера в магазинах РФ "
             "и отправляю данные в GigaChat..."
         )
     else:
-        await message.answer("⏳ Считаю заказ и ищу реальную цену в магазинах РФ...")
+        await message.answer(
+            "⏳ Считаю заказ и ищу реальную цену вашего размера в магазинах РФ..."
+        )
 
     # --- Расчёт итоговой стоимости ---
     if order_type == "buyer":
@@ -170,8 +201,13 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         shipping_line = f"• Международное Карго: <b>{shipping:,.2f} ₽</b>".replace(",", " ")
         extra_lines = f"• Использован ваш личный курс: <b>{rate:.2f} ₽ / 1 ¥</b>\n"
 
-    # --- РЕАЛЬНЫЙ поиск цены такой же пары в магазинах РФ ---
-    rf_price = await fetch_real_rf_price(model_name)
+    size_line = f"📏 Размер: <b>{shoe_size}</b>\n" if shoe_size else ""
+
+    # --- ЧЕСТНЫЙ поиск цены такого же размера в магазинах РФ ---
+    # Внутри fetch_real_rf_price все найденные цены ниже total_rub * 0.85
+    # отсеиваются как гарантированный мусор (носки, шнурки, паль), а затем
+    # считается усечённое среднее (без одной минимальной и максимальной).
+    rf_price = await fetch_real_rf_price(model_name, shoe_size, total_rub)
     rf_found = rf_price > 0
     savings = (rf_price - total_rub) if rf_found else 0.0
 
@@ -180,9 +216,10 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     if ai_state.is_ai_available():
         try:
             # Если rf_price == 0, внутри get_gigachat_verdict нейронке
-            # передаётся фраза: "В магазинах РФ цена неизвестна, проанализируй
-            # только выгоду рублевой цены с Poizon".
-            verdict = await get_gigachat_verdict(model_name, total_rub, rf_price)
+            # передаётся инструкция: "В магазинах РФ цена неизвестна,
+            # проанализируй только выгоду рублевой цены с Poizon".
+            # Размер обуви также учитывается моделью в вердикте.
+            verdict = await get_gigachat_verdict(model_name, total_rub, rf_price, shoe_size)
             verdict_block = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}\n"
@@ -194,12 +231,12 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     # --- Блок вывода (ИИ или математика), плюс строка про цену РФ ---
     if rf_found:
         rf_line = (
-            f"🇷🇺 Цена такой же пары в магазинах РФ (найдено в сети): "
+            f"🇷🇺 Цена такого же размера в магазинах РФ (найдено в сети): "
             f"~{rf_price:,.2f} ₽".replace(",", " ") + "\n"
             + f"💎 Ваша выгода: <b>{savings:,.2f} ₽</b>\n".replace(",", " ")
         )
     else:
-        rf_line = "⚠️ Не удалось найти модель в магазинах РФ\n"
+        rf_line = "⚠️ Не удалось найти данный размер модели в магазинах РФ\n"
 
     if not verdict_block:
         # ИИ недоступен — добавляем простой математический вывод без нейронки.
@@ -221,8 +258,9 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         else:
             math_block = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <b>Вывод:</b> сравнить с ценами в РФ не удалось — модель "
-                f"не найдена в открытых магазинах. Оценивайте итог самостоятельно.\n"
+                f"💡 <b>Вывод:</b> сравнить с ценами в РФ не удалось — данный "
+                f"размер модели не найден в открытых магазинах. Оценивайте итог "
+                f"самостоятельно.\n"
             )
         verdict_block = math_block
 
@@ -230,6 +268,7 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         f"🧾 <b>ДЕТАЛЬНЫЙ ЧЕК ЗАКАЗА POIZON</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👟 Модель: <b>{model_name}</b>\n"
+        f"{size_line}"
         f"📦 Тип заказа: {type_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Расходы:</b>\n"
