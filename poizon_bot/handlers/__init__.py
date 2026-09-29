@@ -15,9 +15,10 @@ class BotStates(StatesGroup):
     waiting_for_first_rate = State()   # Первый запуск: ввод стартового курса
     waiting_for_rate = State()         # Изменение курса из настроек
     choosing_type = State()            # Выбор типа заказа (Байер / Карго)
-    waiting_for_price = State()        # Ввод цены (руб для Байера, юани для Карго)
-    waiting_for_shipping = State()     # Ввод стоимости доставки в рублях
-    waiting_for_model_name = State()   # Ввод названия модели для ИИ-анализа
+    waiting_for_price = State()        # Шаг 1: ввод цены (руб для Байера, юани для Карго)
+    waiting_for_shipping = State()     # Шаг 2: ввод стоимости доставки в рублях
+    waiting_for_size = State()         # Шаг 3: ввод размера кроссовок
+    waiting_for_model_name = State()   # Шаг 4: ввод названия модели для ИИ-анализа
 
 
 router = Router()

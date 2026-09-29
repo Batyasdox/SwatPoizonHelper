@@ -1,12 +1,18 @@
 """
-api/gigachat.py — Взаимодействие с API GigaChat от Сбера + реальный поиск цен в РФ.
+api/gigachat.py — Взаимодействие с API GigaChat от Сбера + ЧЕСТНЫЙ реальный
+поиск цен в магазинах России.
 
 Здесь реализованы:
  - тест доступности API при запуске бота (test_gigachat_api);
  - получение Access Token по OAuth (с уникальным RqUID через uuid.uuid4());
  - отправка промпта в Chat-эндпоинт и получение ИИ-вердикта;
- - РЕАЛЬНЫЙ (бесплатный, без платных API-ключей) поиск цены модели в магазинах
-   России через парсинг HTML-выдачи DuckDuckGo (fetch_real_rf_price).
+ - РЕАЛЬНЫЙ (бесплатный, без платных API-ключей) поиск цены модели ЗАДАННОГО
+   РАЗМЕРА в магазинах России через парсинг HTML-выдачи DuckDuckGo
+   (fetch_real_rf_price) с УМНЫМ ДИНАМИЧЕСКИМ ФИЛЬТРОМ:
+     * все цены ниже total_poizon_rub * 0.85 отсекаются — это гарантированно
+       убирает мусор (носки, шнурки, стельки, подделки/паль);
+     * из оставшихся выбрасываются одна самая низкая и одна самая высокая цена
+       (усечённое среднее), считаются только адекватные значения.
 
 Логика использования ИИ: если тест при запуске прошёл — нейронка используется
 в чеках; если тест упал — ИИ-аналитика просто НЕ используется (флаг
@@ -24,7 +30,6 @@ import json
 import logging
 import re
 import uuid
-from urllib.parse import quote_plus
 
 import aiohttp
 
@@ -146,41 +151,97 @@ async def _get_access_token(session: aiohttp.ClientSession) -> str:
                 break
         await asyncio.sleep(0.2)  # маленькая пауза между попытками
 
-    raise RuntimeError(f"OAuth Сбера отверг все варианты scope. Последняя ошибка: {last_error}")
+    raise RuntimeError(
+        f"OAuth Сбера отверг все варианты scope. Последняя ошибка: {last_error}"
+    )
 
 
-async def get_gigachat_verdict(model_name: str, total_poizon_rub: float, rf_price_rub: float) -> str:
+def sanitize_verdict_text(text: str) -> str:
+    """
+    Очищает текст вердикта нейронки для безопасной вставки в HTML-сообщение
+    Telegram (parse_mode=HTML).
+
+    Markdown-акцент **текст** ломает HTML-разметку, поэтому двойные звёздочки
+    заменяются на HTML-теги <b> и </b> ПО ОЧЕРЕДИ: первая '**' открывает
+    жирный (<b>), вторая — закрывает (</b>), третья снова открывает и т.д.
+    Если количество '**' нечётное и тег остался незакрытым — он докрывается.
+    Одиночные '*' вычищаются полностью, а '<'/'>' экранируются, чтобы
+    пользовательский ввод или текст модели не сломали разметку сообщения.
+    """
+    if not text:
+        return ""
+
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+
+    result_parts: list[str] = []
+    open_tag = True  # следующая пара '**' должна открыть <b>
+    i = 0
+    while i < len(text):
+        if text[i : i + 2] == "**":
+            result_parts.append("<b>" if open_tag else "</b>")
+            open_tag = not open_tag
+            i += 2
+        else:
+            result_parts.append(text[i])
+            i += 1
+
+    cleaned = "".join(result_parts)
+
+    # Если осталась незакрытая <b> (нечётное число '**') — докрываем </b>,
+    # иначе Telegram выдаст ошибку парсинга HTML.
+    if cleaned.count("<b>") > cleaned.count("</b>"):
+        cleaned += "</b>"
+
+    # На всякий случай убираем одиночные звёздочки, которые могли остаться.
+    cleaned = cleaned.replace("*", "")
+    return cleaned.strip()
+
+
+async def get_gigachat_verdict(
+    model_name: str,
+    total_poizon_rub: float,
+    rf_price_rub: float,
+    shoe_size: str = "",
+) -> str:
     """
     Асинхронная функция: запрашивает у GigaChat ёмкий вердикт на русском языке
-    о выгодности покупки кроссовок.
+    о выгодности покупки кроссовок КОНКРЕТНОГО РАЗМЕРА.
 
     Args:
         model_name:       точное название модели кроссовок;
         total_poizon_rub: итоговая стоимость заказа с Poizon в рублях;
-        rf_price_rub:     НАЙДЕННАЯ цена такой же пары в магазинах РФ в рублях
-                          (0.0 означает, что цену найти не удалось — в этом
-                          случае нейронке передаётся специальная формулировка).
+        rf_price_rub:     НАЙДЕННАЯ (после динамической фильтрации) цена такой
+                          же пары в РФ в рублях. 0.0 означает, что цену найти
+                          не удалось — нейронке передаётся специальная
+                          формулировка про анализ только рублевой цены Poizon;
+        shoe_size:        размер обуви (например "42 EU"), добавляется в промпт,
+                          чтобы ИИ учитывал редкость/ходовость размера.
 
     Returns:
-        Текст вердикта (3-4 предложения) от нейросети.
+        Текст вердикта (3-4 предложения) от нейросети (уже без markdown '**').
 
     Raises:
         Любое исключение при ошибках сети/авторизации/API пробрасывается
         наружу — вызывающий код (calculator) сам решит, что ИИ недоступен,
         отключит его флагом и сформирует чек без ИИ-вердикта.
     """
+    size_part = f" размера {shoe_size}" if shoe_size else ""
+
     if rf_price_rub and rf_price_rub > 0:
         price_part = (
-            f"выгодна ли покупка кроссовок {model_name} за цену {total_poizon_rub:.2f} руб "
-            f"по сравнению с РФ ценой {rf_price_rub:.2f} руб? "
+            f"выгодна ли покупка кроссовок {model_name}{size_part} за цену "
+            f"{total_poizon_rub:.2f} руб по сравнению с РФ ценой "
+            f"{rf_price_rub:.2f} руб? Обязательно учитывай размер "
+            f"{shoe_size or 'не указан'}: если размер ходовой — сравнение "
+            f"корректно, если редкий — цена в РФ может быть выше из-за дефицита. "
             f"Укажи примерную выгоду или переплату в рублях и процентах."
         )
     else:
         price_part = (
             f"В магазинах РФ цена неизвестна, проанализируй только выгоду "
-            f"рублевой цены с Poizon: кроссовки {model_name} стоят "
+            f"рублевой цены с Poizon: кроссовки {model_name}{size_part} стоят "
             f"{total_poizon_rub:.2f} руб под заказ. Оцени, нормальная ли это "
-            f"рыночная цена для такой модели."
+            f"рыночная цена для такой модели и размера."
         )
 
     prompt = (
@@ -189,7 +250,8 @@ async def get_gigachat_verdict(model_name: str, total_poizon_rub: float, rf_pric
         f"{price_part} "
         f"Если в названии модели есть слово 'Custom' или 'Кастом', "
         f"обязательно подчеркни эксклюзивность и уникальность такой пары, "
-        f"и то, что для кастомных моделей экономия может быть вторична."
+        f"и то, что для кастомных моделей экономия может быть вторична. "
+        f"Пиши обычный текст, без markdown-разметки со звёздочками."
     )
 
     async with aiohttp.ClientSession() as session:
@@ -212,7 +274,9 @@ async def get_gigachat_verdict(model_name: str, total_poizon_rub: float, rf_pric
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                raise RuntimeError(f"GigaChat Chat вернул HTTP {resp.status}: {body[:300]}")
+                raise RuntimeError(
+                    f"GigaChat Chat вернул HTTP {resp.status}: {body[:300]}"
+                )
             data = await resp.json()
 
     choices = data.get("choices") or []
@@ -222,7 +286,9 @@ async def get_gigachat_verdict(model_name: str, total_poizon_rub: float, rf_pric
     verdict = choices[0]["message"]["content"].strip()
     if not verdict:
         raise RuntimeError("GigaChat вернул пустой текст вердикта")
-    return verdict
+
+    # Чистим markdown '**' -> HTML <b></b>, чтобы не ломать parse_mode="HTML".
+    return sanitize_verdict_text(verdict)
 
 
 async def test_gigachat_api() -> tuple[bool, str]:
@@ -233,8 +299,10 @@ async def test_gigachat_api() -> tuple[bool, str]:
     что нейронка отвечает.
 
     Returns:
-        (True,  "текст ответа нейронки")  — если API работает, вердикт можно использовать;
-        (False, "описание ошибки")        — если любая ошибка, ИИ использовать НЕЛЬЗЯ.
+        (True,  "текст ответа нейронки")  — если API работает, вердикт можно
+                                            использовать;
+        (False, "описание ошибки")        — если любая ошибка, ИИ использовать
+                                            НЕЛЬЗЯ.
     """
     try:
         async with aiohttp.ClientSession(
@@ -276,11 +344,11 @@ async def test_gigachat_api() -> tuple[bool, str]:
 
 
 # ============================================================================
-# РЕАЛЬНЫЙ ПОИСК ЦЕН В МАГАЗИНАХ РФ (без платных API-ключей)
+# ЧЕСТНЫЙ РЕАЛЬНЫЙ ПОИСК ЦЕН В МАГАЗИНАХ РФ (без платных API-ключей)
 # ============================================================================
 
-# Фейковые User-Agent'ы: меняем их между запросами, чтобы DuckDuckGo
-# не заблокила бота как «бота».
+# Фейковые User-Agent'ы: меняем их между запросами, чтобы поисковик
+# не заблокировал бота как «бота».
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -297,29 +365,42 @@ DDG_SEARCH_URLS = [
     "https://lite.duckduckgo.com/lite/",
 ]
 
-# Минимальная осмысленная цена оригинальных кроссовок в РФ (меньше — мусор).
+# Жёсткие границы осмысленных цен (подстраховка к динамическому фильтру):
+# меньше 3000 руб оригинальные кроссовки стоить не могут (это носки/шнурки),
+# больше 1.5 млн — оптовая пачка или ошибка парсинга.
 MIN_VALID_RF_PRICE = 3000.0
-# Максимальная разумная планка (выше — скорее всего оптовая пачка или ошибка).
 MAX_VALID_RF_PRICE = 1_500_000.0
+
+# Коэффициент динамического порога: любые цены НИЖЕ
+# (total_poizon_rub * DYNAMIC_FILTER_COEF) гарантированно мусор
+# (носки, шнурки, стельки, паль) — оригинал в РФ не может стоить
+# сильно дешевле закупки в Китае с доставкой.
+DYNAMIC_FILTER_COEF = 0.85
 
 # Регулярки для поиска цен в тексте выдачи:
 #  1) "от 12 900 руб", "12900 рублей", "цена 12 900 ₽";
 #  2) "₽ после числа": "12 900 ₽";
-#  3) "цена: 12900" / "стоимость 12 900" — число без suffix, но после слова про цену.
+#  3) "цена: 12900" — число без suffix, но сразу после слова про цену.
 PRICE_PATTERNS = [
-    re.compile(r"(?:от|до|цена|стоимость)?\s*([\d][\d\s\u00a0\u2009]{3,})\s*(?:руб\.?л?е?й?|рублей?\b)", re.IGNORECASE),
-    re.compile(r"([\d][\d\s\u00a0\u2009]{3,})\s*₽"),
-    re.compile(r"(?:цена|стоимость|прайс)[^\d]{0,15}([\d][\d\s\u00a0\u2009]{3,})", re.IGNORECASE),
+    re.compile(
+        r"(?:от|до|цена|стоимость)?\s*([\d][\d\s\u00a0\u2009]{3,})\s*"
+        r"(?:руб\.?л?е?й?|рублей?\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"([\d][\d\s\u00a0\u2009]{3,})\s*\u20bd"),
+    re.compile(
+        r"(?:цена|стоимость|прайс)[^\d]{0,15}([\d][\d\s\u00a0\u2009]{3,})",
+        re.IGNORECASE,
+    ),
 ]
 
 
 def _extract_prices_from_text(text: str) -> list[float]:
     """
     Вытаскивает из произвольного HTML/текста все денежные числа вида
-    "от Х ХХХ руб" / "ХХХХХ ₽", фильтрует слишком маленькие (< 3000 руб,
-    оригинальные кроссовки столько стоить не могут) и слишком большие.
-    Возвращает список УНИКАЛЬНЫХ цен (дубликаты от разных регулярных
-    выражений убираются).
+    "от Х ХХХ руб" / "ХХХХХ ₽". Предварительно отсеивает явный мусор по
+    жёстким границам (< 3000 руб и > 1.5 млн руб). Возвращает список
+    УНИКАЛЬНЫХ цен (дубликаты от разных регулярных выражений убираются).
     """
     found: set[float] = set()
     for pattern in PRICE_PATTERNS:
@@ -362,53 +443,70 @@ async def _fetch_ddg_page(
             ) as resp:
                 if resp.status == 200:
                     return await resp.text(errors="ignore")
-                logger.warning("DuckDuckGo %s вернул HTTP %s (попытка %d/%d)",
-                               url, resp.status, attempt + 1, max_attempts)
+                logger.warning(
+                    "DuckDuckGo %s вернул HTTP %s (попытка %d/%d)",
+                    url, resp.status, attempt + 1, max_attempts,
+                )
                 # 202/403/429 — антибот-пауза, пробуем ещё раз с другой «личностью»
                 if resp.status in (202, 403, 429):
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 return ""
-        except Exception as exc:  # noqa: BLE001 — сеть/DNS/таймаут: считаем, что страница не найдена
-            logger.warning("DuckDuckGo %s: ошибка запроса (попытка %d/%d): %s: %s",
-                           url, attempt + 1, max_attempts, type(exc).__name__, exc)
+        except Exception as exc:  # noqa: BLE001 — сеть/DNS/таймаут: страница не найдена
+            logger.warning(
+                "DuckDuckGo %s: ошибка запроса (попытка %d/%d): %s: %s",
+                url, attempt + 1, max_attempts, type(exc).__name__, exc,
+            )
             await asyncio.sleep(1.5)
     return ""
 
 
-async def fetch_real_rf_price(model_name: str) -> float:
+async def fetch_real_rf_price(
+    model_name: str, shoe_size: str, total_poizon_rub: float
+) -> float:
     """
-    Асинхронный РЕАЛЬНЫЙ поиск цены модели в магазинах России
-    (Яндекс.Маркет, СДЭК.Шоппинг, Спортмастер и др.) через бесплатный
-    парсинг HTML-выдачи DuckDuckGo. Никаких платных API-ключей не требует.
+    Асинхронный ЧЕСТНЫЙ поиск цены модели ЗАДАННОГО РАЗМЕРА в магазинах России
+    (Яндекс.Маркет, СДЭК.Шоппинг, Спортмастер и др.) через бесплатный парсинг
+    HTML-выдачи DuckDuckGo. Никаких платных API-ключей не требует.
 
     Алгоритм:
-      1. Формирует поисковый запрос вида "{model_name} купить в России цена руб".
-      2. GET-запросом (с фейковым User-Agent) грузит страницы html.duckduckgo.com
-         и lite.duckduckgo.com.
-      3. Регулярными выражениями собирает все совпадения цен ("от Х ХХХ руб",
-         "ХХХХХ ₽" и т.п.).
-      4. Фильтрует цены меньше 3000 руб и возвращает СРЕДНЕЕ арифметическое
-         из оставшихся.
+      1. Формирует точный поисковый запрос:
+         "{model_name} {shoe_size} купить в россии цена руб".
+      2. Делает асинхронный GET-запрос через aiohttp с фейковым User-Agent.
+      3. Извлекает регулярными выражениями все найденные цены в список.
+      4. ДИНАМИЧЕСКАЯ ФИЛЬТРАЦИЯ: min_allowed_price = total_poizon_rub * 0.85;
+         все цены НИЖЕ порога удаляются (гарантированно отсекает шнурки,
+         носки и паль).
+      5. УСЕЧЁННОЕ СРЕДНЕЕ: список сортируется по возрастанию; если элементов
+         больше 4 — удаляются ОДНА самая низкая и ОДНА самая высокая цена.
+      6. Возвращает среднее арифметическое оставшихся цен.
+
+    Args:
+        model_name:       точное название модели кроссовок;
+        shoe_size:        размер обуви, вшитый в поисковый запрос ("42 EU");
+        total_poizon_rub: итоговая рублёвая цена заказа с Poizon — база для
+                          динамического порога фильтрации.
 
     Returns:
-        Найденная средняя цена в рублях либо 0.0, если ничего не нашлось
-        или произошла любая ошибка.
+        Найденная усечённая средняя цена в рублях либо 0.0, если после
+        фильтрации список пуст или произошла любая ошибка.
     """
     model_name = (model_name or "").strip()
+    shoe_size = (shoe_size or "").strip()
     if not model_name:
         return 0.0
 
+    # 1. Точный поисковый запрос с размером.
     queries = [
-        f"{model_name} купить в России цена руб",
-        f"{model_name} купить цена руб Яндекс Маркет",
+        f"{model_name} {shoe_size} купить в россии цена руб",
+        f"{model_name} {shoe_size} купить цена руб",
     ]
 
     all_prices: list[float] = []
     try:
         connector = aiohttp.TCPConnector(ssl=False, limit=5)
         async with aiohttp.ClientSession(
-            connector=connector, timeout=aiohttp.ClientTimeout(total=45)
+            connector=connector, timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             for query in queries:
                 for url in DDG_SEARCH_URLS:
@@ -419,24 +517,47 @@ async def fetch_real_rf_price(model_name: str) -> float:
                 if all_prices:
                     break  # первый запрос уже дал цены — второй не нужен
     except Exception as exc:  # noqa: BLE001 — любая ошибка => возвращаем 0
-        logger.warning("fetch_real_rf_price('%s'): ошибка: %s: %s",
-                       model_name, type(exc).__name__, exc)
+        logger.warning(
+            "fetch_real_rf_price('%s'): ошибка: %s: %s",
+            model_name, type(exc).__name__, exc,
+        )
         return 0.0
 
     if not all_prices:
-        logger.info("fetch_real_rf_price('%s'): цены не найдены", model_name)
+        logger.info(
+            "fetch_real_rf_price('%s %s'): цены не найдены", model_name, shoe_size
+        )
         return 0.0
 
-    # Отбрасываем явный мусор: считаем среднее по уникальным значениям,
-    # предварительно убрав единичные выбросы ниже медианы вдвое.
+    # 4. ДИНАМИЧЕСКАЯ ФИЛЬТРАЦИЯ: отсечь всё, что дешевле 85% цены Poizon.
     unique_prices = sorted(set(all_prices))
-    if len(unique_prices) >= 3:
-        median = unique_prices[len(unique_prices) // 2]
-        unique_prices = [p for p in unique_prices if p >= median / 2]
+    total_poizon_rub = float(total_poizon_rub or 0.0)
+    if total_poizon_rub > 0:
+        min_allowed_price = total_poizon_rub * DYNAMIC_FILTER_COEF
+        unique_prices = [p for p in unique_prices if p >= min_allowed_price]
+        logger.debug(
+            "fetch_real_rf_price('%s'): порог %.2f руб, после фильтра %d цен",
+            model_name, min_allowed_price, len(unique_prices),
+        )
 
-    average = sum(unique_prices) / len(unique_prices)
+    if not unique_prices:
+        logger.info(
+            "fetch_real_rf_price('%s %s'): после динамической фильтрации не "
+            "осталось ни одной честной цены (весь мусор отсеян)",
+            model_name, shoe_size,
+        )
+        return 0.0
+
+    # 5. УСЕЧЁННОЕ СРЕДНЕЕ: при выборке > 4 убираем самую низкую и самую высокую.
+    trimmed = list(unique_prices)  # список уже отсортирован по возрастанию
+    if len(trimmed) > 4:
+        trimmed = trimmed[1:-1]
+
+    # 6. Среднее арифметическое оставшихся.
+    average = sum(trimmed) / len(trimmed)
     logger.info(
-        "fetch_real_rf_price('%s'): найдено %d цен, среднее = %.2f руб",
-        model_name, len(unique_prices), average,
+        "fetch_real_rf_price('%s %s'): собрано %d уникальных цен, после "
+        "фильтрации %d, итого среднее = %.2f руб",
+        model_name, shoe_size, len(set(all_prices)), len(trimmed), average,
     )
     return round(average, 2)
