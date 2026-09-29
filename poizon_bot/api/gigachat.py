@@ -12,11 +12,13 @@ api/gigachat.py — Взаимодействие с API GigaChat от Сбера
 ai_state.AI_AVAILABLE остаётся False). get_gigachat_verdict при любой ошибке
 бросает исключение наружу, чтобы вызывающий код мог сам отключить ИИ.
 
-ВАЖНО: реальные эндпоинты Сбера указаны как https://sberbank.ru
-(см. config.py). Все post-запросы выполняются с ssl=False, как требуется проектом.
+ВАЖНО: рабочие эндпоинты GigaChat задаются в config.py
+(GIGACHAT_OAUTH_URL / GIGACHAT_CHAT_URL). Все post-запросы выполняются
+с ssl=False, как требуется проектом.
 """
 
 import base64
+import json
 import uuid
 
 import aiohttp
@@ -52,10 +54,25 @@ async def _get_access_token(session: aiohttp.ClientSession) -> str:
         "Authorization": _get_basic_auth_header(),
         "RqUID": str(uuid.uuid4()),
     }
+    # ВНИМАНИЕ: значение scope зависит от типа ключа в кабинете Сбера
+    # (developers.sber.ru -> ваш проект -> GigaAPI -> "Спецификация доступа"):
+    #   - GIGACHTAPI                — стандартный scope для GigaChat;
+    #   - GIGACHAT_API_PERSONAL     — персональный режим ("Индивидуальный");
+    #   - GIGACHAT_API_CORP_FQBK и др. — корпоративные режимы.
+    # Если OAuth вернёт "scope data format invalid" — откройте карточку ключа
+    # в кабинете Сбера и скопируйте значение scope оттуда точно как написано.
     payload = {"scope": "GIGACHTAPI"}
 
     async with session.post(GIGACHAT_OAUTH_URL, data=payload, headers=headers, ssl=False) as resp:
-        data = await resp.json()
+        body_text = await resp.text()
+        if resp.status != 200:
+            raise RuntimeError(
+                f"OAuth Сбера вернул HTTP {resp.status}: {body_text[:300]}"
+            )
+        try:
+            data = json.loads(body_text)
+        except ValueError:
+            raise RuntimeError(f"OAuth Сбера вернул не-JSON ответ: {body_text[:300]}")
         access_token = data.get("access_token")
         if not access_token:
             raise RuntimeError(f"Не удалось получить Access Token от Сбера: {data}")
