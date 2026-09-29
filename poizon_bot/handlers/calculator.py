@@ -10,7 +10,9 @@ handlers/calculator.py — Основная бизнес-логика расчё
     запрашивает цену в ЮАНЯХ (¥) и конвертирует по личному курсу из БД.
     Итог = (Цена_Юани * Курс_Из_БД) + Доставка_Руб.
 
-Финал: mock-цена РФ -> ИИ-вердикт GigaChat -> красивый HTML-чек.
+Финал: mock-цена РФ -> чек. ИИ-вердикт GigaChat добавляется в чек ТОЛЬКО если
+при запуске бота тест API прошёл успешно (ai_state.is_ai_available() == True).
+Если нейронка недоступна — чек формируется без ИИ-блока, только математика.
 """
 
 from aiogram import F
@@ -18,6 +20,7 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+import ai_state
 import database
 from api.gigachat import get_gigachat_verdict, get_mock_rf_price
 from handlers import BotStates, router
@@ -117,7 +120,7 @@ async def save_shipping(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(BotStates.waiting_for_model_name), F.text)
 async def finish_calculation(message: Message, state: FSMContext) -> None:
-    """Шаг 3 + Финал: считаем итог, получаем ИИ-вердикт и печатаем чек."""
+    """Шаг 3 + Финал: считаем итог и печатаем чек (с ИИ-вердиктом, если нейронка доступна)."""
     model_name = message.text.strip()
     if not model_name:
         await message.answer("❌ Ошибка! Название модели не может быть пустым. Попробуйте ещё раз:")
@@ -132,7 +135,10 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     rate = database.get_user_rate(user_id)
 
-    await message.answer("⏳ Считаю заказ и отправляю данные в GigaChat...")
+    if ai_state.is_ai_available():
+        await message.answer("⏳ Считаю заказ и отправляю данные в GigaChat...")
+    else:
+        await message.answer("⏳ Считаю заказ...")
 
     # --- Расчёт итоговой стоимости ---
     if order_type == "buyer":
@@ -158,8 +164,36 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
     rf_price = get_mock_rf_price(total_rub)
     savings = rf_price - total_rub
 
-    # --- ИИ-вердикт от GigaChat ---
-    verdict = await get_gigachat_verdict(model_name, total_rub, rf_price)
+    # --- ИИ-вердикт от GigaChat: только если тест при запуске прошёл успешно ---
+    verdict_block = ""
+    if ai_state.is_ai_available():
+        try:
+            verdict = await get_gigachat_verdict(model_name, total_rub, rf_price)
+            verdict_block = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}\n"
+            )
+        except Exception:  # noqa: BLE001 — нейронка отвалилась в процессе работы
+            # Раз ошибка — больше ИИ не используем (до перезапуска бота)
+            ai_state.set_ai_available(False)
+
+    # Если ИИ недоступен — добавляем простой математический вывод без нейронки
+    if not verdict_block:
+        savings_pct = (savings / rf_price * 100) if rf_price > 0 else 0.0
+        if savings > 0:
+            math_block = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <b>Вывод:</b> покупка выгоднее покупки в РФ примерно на "
+                f"{savings:,.2f} ₽ ({savings_pct:.1f}%).".replace(",", " ") + "\n"
+            )
+        else:
+            math_block = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <b>Вывод:</b> покупка дороже рыночной цены в РФ примерно на "
+                f"{-savings:,.2f} ₽ ({-savings_pct:.1f}%), возможно выгоднее "
+                f"взять пару локально.".replace(",", " ") + "\n"
+            )
+        verdict_block = math_block
 
     savings_str = f"{savings:,.2f} ₽".replace(",", " ")
     check_text = (
@@ -176,8 +210,7 @@ async def finish_calculation(message: Message, state: FSMContext) -> None:
         f"🔥 <b>ИТОГО: {total_rub:,.2f} ₽</b>\n".replace(",", " ")
         + f"🇷🇺 Цена такой же пары в РФ (оценка): ~{rf_price:,.2f} ₽".replace(",", " ") + "\n"
         + f"💎 Ваша выгода: <b>{savings_str}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>ИИ-вердикт от GigaChat (Сбер):</b>\n{verdict}"
+        f"{verdict_block}"
     )
 
     kb = InlineKeyboardMarkup(
